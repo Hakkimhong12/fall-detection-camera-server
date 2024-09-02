@@ -13,7 +13,11 @@ import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning, module='google.cloud.firestore_v1.base_collection')
 # Firebase initialization
-cred = credentials.Certificate("key/service-account.json")
+key_path = os.getenv('FALL_DETECTION_PROJECT')
+if key_path is None:
+    raise EnvironmentError("FALL_DETECTION_PROJECT environment variable is not set.")
+
+cred = credentials.Certificate(key_path)
 firebase_admin.initialize_app(cred, {
     'storageBucket': 'falldetectionwebsite.appspot.com'
 })
