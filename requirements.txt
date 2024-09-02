@@ -1,0 +1,8 @@
+flask
+flask_socketio
+opencv-python
+ultralytics
+firebase_admin
+torch
+
+
