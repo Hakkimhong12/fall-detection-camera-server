@@ -3,7 +3,7 @@ import os
 from datetime import datetime as dt 
 import ssl 
 import smtplib
-import datetime
+from datetime import datetime 
 from email.message import EmailMessage
 #from config import CAMERA_ID
 import firebase_admin
@@ -68,48 +68,48 @@ def get_camera_details(camera_id):
         
         if camera_details is None:
             print(f"No details found for camera ID: {camera_id}")
-            return None, None 
+            return None
         
         location = camera_details['room']
         return location
     except KeyError as e:
         print(f"Missing expected data: {str(e)}")
-        return None, None 
+        return None
     except Exception as e:
         print(f"Error fetching camera details: {str(e)}")
-        return None, None 
+        return None
     
 # Get user's email from specific CAMERA ID
 def get_users_by_camera_id(camera_id):
     try:
-        # Retrieve the list of camera IDs from 'Camera Information'
-        camera_ref = db.collection('Camera Information')
-        camera_query = camera_ref.where('cameraId', '==', camera_id)
-        camera_docs = camera_query.stream()
+        # Retrieve userUids from 'Camera Access' using cameraId
+        camera_access_ref = db.collection('Camera Access')
+        access_query = camera_access_ref.where('cameraId', '==', camera_id)
+        access_docs = access_query.stream()
         
-        camera_ids = [doc.id for doc in camera_docs]
+        user_uids = [doc.to_dict().get('userUid') for doc in access_docs]
         
-        if not camera_ids:
-            print(f"No camera found with ID: {camera_id}")
+        if not user_uids:
+            print(f"No users found with camera ID: {camera_id}")
             return None
 
-        # Retrieve users from 'User Informations' using the camera IDs
-        user_ref = db.collection('User Informations')
-        user_query = user_ref.where('cameraId', 'in', camera_ids)
-        users = user_query.stream()
-        
+        # Retrieve emails from 'User Information' using userUids
         email_receivers = []
-        for user in users:
-            user_data = user.to_dict()
-            email = user_data.get('email')
-            if email:
-                email_receivers.append(email)
+        user_ref = db.collection('User Informations')
+        for user_uid in user_uids:
+            user_doc = user_ref.document(user_uid).get()
+            if user_doc.exists:
+                user_data = user_doc.to_dict()
+                email = user_data.get('email')
+                if email:
+                    email_receivers.append(email)
         
         return email_receivers
-    
+
     except Exception as e:
         print(f"Error fetching users by camera ID: {camera_id} - {str(e)}")
         return None
+
 
 # Caculate the average frame per second
 def calculate_avg_fps(frames_before, before_timestamps, frames_after=None, after_timestamps=None):
@@ -291,9 +291,9 @@ def get_video_footage_record_time(camera_id):
         return None
         
 # Send email to all user (CAMERA ID)
-def send_email(video_url, fall_time, doc_id, fall_frame, last_frame, camera_id):
-    location, image_url = get_camera_details(camera_id)
-    if location is None and image_url is None: 
+def send_email(video_url, fall_time, fall_frame, camera_id):
+    location = get_camera_details(camera_id)
+    if location is None: 
         print(f"Failed to fetch camera details for camera ID: {camera_id}")
         return 
     
@@ -302,7 +302,7 @@ def send_email(video_url, fall_time, doc_id, fall_frame, last_frame, camera_id):
         print(f"No email receivers found for camera ID: {camera_id}")
         return 
     
-    tdatetime = dt.now()
+    tdatetime = datetime.now()
     tstr = tdatetime.strftime("%Y-%m-%d %H:%M:%S")
     email_sender = 'godapple79@gmail.com'
     email_password = 'pblh ylrc vlgi aomt'
@@ -315,7 +315,6 @@ def send_email(video_url, fall_time, doc_id, fall_frame, last_frame, camera_id):
     - Camera ID: {camera_id}
     - Room: {location}
     - Fall Video URL: {video_url}
-    - Event ID: {doc_id}
     """
 
     em = EmailMessage()
@@ -325,10 +324,10 @@ def send_email(video_url, fall_time, doc_id, fall_frame, last_frame, camera_id):
     em.set_content(body)
     
     _, fall_img_encoded = cv2.imencode('.jpg', fall_frame)
-    _, last_img_encoded = cv2.imencode('.jpeg', last_frame)
+    # _, last_img_encoded = cv2.imencode('.jpeg', last_frame)
     
     em.add_attachment(fall_img_encoded.tobytes(), maintype='image', subtype='jpg', filename='fall_frame.jpg')
-    em.add_attachment(last_img_encoded.tobytes(), maintype='image', subtype='jpg', filename='last_frame.jpg')
+    # em.add_attachment(last_img_encoded.tobytes(), maintype='image', subtype='jpg', filename='last_frame.jpg')
     
     context = ssl.create_default_context()
     
@@ -408,4 +407,13 @@ def save_video_footage(frames, timestamps, camera_id):
         return None
     
     
-
+def upload_notification_video(filename, camera_id):
+    try:
+        bucket = storage.bucket()
+        storage_ref = bucket.blob(f'Notification Video/{filename}')
+        storage_ref.upload_from_filename(filename)
+        storage_ref.make_public()
+        return storage_ref.public_url
+    except Exception as e:
+        print(f"Error uploading video to Firebase: {str(e)}")
+        return None
