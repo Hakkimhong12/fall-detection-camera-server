@@ -26,21 +26,22 @@ db = firestore.client()
 current_video_writer = None 
 
 def fetch_camera_info():
-    camera_docs = db.collection('Patient Informations').get()
+    camera_docs = db.collection('Patient Informations').order_by('timestamp', direction=firestore.Query.DESCENDING).get()
     camera_info = []
     for doc in camera_docs:
         camera_data = doc.to_dict()
-        if 'cameraId' in camera_data and 'patientName' in camera_data:
+        if 'cameraId' in camera_data and 'patientName' in camera_data and 'timestamp' in camera_data:
             camera_id = camera_data['cameraId']
             patient_name = camera_data['patientName']
-            camera_info.append((camera_id, patient_name))
+            timestamp = camera_data['timestamp']
+            camera_info.append((camera_id, patient_name, timestamp))
     return camera_info
 
 def display_camera_table(camera_info):
     table = PrettyTable()
-    table.field_names = ["Order", "Camera ID", "Patient Name"]
-    for i, (camera_id, patient_name) in enumerate(camera_info, 1):
-        table.add_row([i, camera_id, patient_name])
+    table.field_names = ["Order", "Camera ID", "Patient Name", "Timestamp"]
+    for i, (camera_id, patient_name, timestamp) in enumerate(camera_info, 1):
+        table.add_row([i, camera_id, patient_name, timestamp.strftime('%Y-%m-%d %H:%M:%S')])
     print(table)
 
 def select_camera():
@@ -53,6 +54,7 @@ def select_camera():
             return selection
         else:
             print("Invalid camera ID. Please try again.")
+
 def get_camera_id():
     return select_camera()
 

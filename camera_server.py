@@ -8,12 +8,15 @@ from collections import deque
 from threading import Thread, Event
 import threading
 from queue import Queue, Empty
-from initialize import initialize_model, initialize_logging, initialize_size, result_footage_time
+import os
+from initialize import initialize_model, initialize_logging, initialize_size
 from config import FRAME_WIDTH, FRAME_HEIGHT, MAX_FPS
 from api import save_image, save_video_segment_buffer, upload_video_footage, get_camera_id, send_email, upload_notification_video
 
+# Get camera ID 
 CAMERA_ID = get_camera_id()
 
+# Initialize Flask
 app = Flask(__name__)
 socketio = SocketIO(app)
 
@@ -38,12 +41,17 @@ image_thread = None
 footage_video_thread = None
 upload_thread = None
 image_queue = Queue()
-upload_queue = Queue()
+video_queue = Queue()
+failed_uploads = deque()
 stop_thread = Event()
 current_video_writer = None 
 current_video_start_time = None 
 email_sent = False
 
+# Number of failed upload 
+MAX_RETRY_ATTEMPTS = 3
+failed_uploads = deque()
+# Save image process
 def save_image_process(frame_with_boxes, fall_detected_time, queue, camera_id):
     try:
         image_url = save_image(frame_with_boxes, fall_detected_time, camera_id)
@@ -51,7 +59,8 @@ def save_image_process(frame_with_boxes, fall_detected_time, queue, camera_id):
     except Exception as e:
         logger.error(f"Error in save_image_process: {str(e)}")
         queue.put(None)
-
+        
+# Save video process
 def save_video_process(frames_before, before_timestamps, frames_after, after_timestamps, fall_detected_time, image_url):
     try:
         save_video_segment_buffer(
@@ -61,11 +70,29 @@ def save_video_process(frames_before, before_timestamps, frames_after, after_tim
         )
     except Exception as e:
         logger.error(f"Error in save_video_process: {str(e)}")
+
+# Process of notification
+def process_notification(notification_video_filename, fall_detected_time, fall_frame):
+    global email_sent
+    notification_video_url = upload_notification_video(notification_video_filename, CAMERA_ID)
+    if notification_video_url and not email_sent:
+        send_email(notification_video_url, fall_detected_time, fall_frame, CAMERA_ID)
+        email_sent = True
+
+# Process of fall confirmation
+def process_fall_confirmation(frame_with_boxes, fall_detected_time):
+    global email_sent
+    
+    notification_video_filename = save_notification_video(buffer_C, fall_detected_time, CAMERA_ID)
+    if notification_video_filename:
+        video_queue.put(notification_video_filename)
+        Thread(target=process_notification, args=(notification_video_filename, fall_detected_time, frame_with_boxes)).start()
         
+# save notification video
 def save_notification_video(buffer_C, fall_detected_time, camera_id):
     try:
         filename = f"notification_{camera_id}_{fall_detected_time.strftime('%Y-%m-%d_%H-%M-%S')}.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')  # Change to 'mp4v' codec
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')
         video_writer = cv2.VideoWriter(filename, fourcc, MAX_FPS, (FRAME_WIDTH, FRAME_HEIGHT))
 
         for _, _, frame in buffer_C:
@@ -77,17 +104,114 @@ def save_notification_video(buffer_C, fall_detected_time, camera_id):
         logger.error(f"Error saving notification video: {str(e)}")
         return None
 
-def save_and_upload_video_footage():
+# Save current video
+def save_current_video():
     global current_video_writer, current_video_start_time
     
-    if current_video_writer:
-        logger.info('Finalizing current video segment')
-        current_video_writer.release()
-        filename = f"{CAMERA_ID}_{datetime.fromtimestamp(current_video_start_time).strftime('%Y-%m-%d_%H-%M-%S')}.mp4"
-        upload_queue.put((filename, CAMERA_ID))
-        current_video_writer = None
-        current_video_start_time = None
+    current_video_writer.release()
+    filename = f"{CAMERA_ID}_{datetime.fromtimestamp(current_video_start_time).strftime('%Y-%m-%d_%H-%M-%S')}.mp4"
+    logger.info(f'Saved video segment: {filename}')
+    current_video_writer = None
+    current_video_start_time = None
+    return filename
 
+# Start new Video
+def start_new_video(current_time):
+    global current_video_writer, current_video_start_time
+    
+    current_video_start_time = current_time
+    filename = f"{CAMERA_ID}_{datetime.fromtimestamp(current_video_start_time).strftime('%Y-%m-%d_%H-%M-%S')}.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*'avc1')
+    current_video_writer = cv2.VideoWriter(filename, fourcc, MAX_FPS, (FRAME_WIDTH, FRAME_HEIGHT))
+    logger.info(f'Started new video segment: {filename}')
+    
+def start_video_processes():
+    global footage_video_thread, upload_thread
+    if footage_video_thread is None or not footage_video_thread.is_alive():
+        footage_video_thread = threading.Thread(target=video_saving_thread)
+        footage_video_thread.start()
+    
+    if upload_thread is None or not upload_thread.is_alive():
+        upload_thread = threading.Thread(target=upload_thread_func)
+        upload_thread.start()
+    
+# video saving thread
+def video_saving_thread():
+    global current_video_writer, current_video_start_time
+    
+    while not stop_thread.is_set():
+        current_time = time.time()
+        
+        if current_video_start_time is None or (current_time - current_video_start_time) >= FOOTAGE_TIME:
+            if current_video_writer:
+                filename = save_current_video()
+                video_queue.put(filename)
+            
+            start_new_video(current_time)
+        
+        time.sleep(1)  # Check every second
+
+    logger.info('Stopping video saving thread')
+    if current_video_writer:
+        filename = save_current_video()
+        video_queue.put(filename)
+        
+# Uplaod thread function
+def upload_thread_func():
+    while not stop_thread.is_set():
+        try:
+            # Check failed uploads first
+            if failed_uploads:
+                filename, camera_id, attempts = failed_uploads.popleft()
+                if attempts < MAX_RETRY_ATTEMPTS:
+                    logger.info(f'Retrying upload for: {filename}')
+                    if os.path.exists(filename):
+                        try:
+                            # Check if it's a notification video
+                            if "notification_" in filename:
+                                upload_notification_video(filename, camera_id)
+                                logger.info(f'Retry notification upload completed: {filename}')
+                            else:
+                                upload_video_footage(filename, camera_id)
+                                logger.info(f'Retry upload completed: {filename}')
+                            os.remove(filename)  # Only delete if upload succeeds
+                        except Exception as upload_error:
+                            logger.error(f"Retry upload failed for {filename}: {str(upload_error)}")
+                            failed_uploads.append((filename, camera_id, attempts + 1))
+                    else:
+                        logger.warning(f'File does not exist for retry: {filename}. It may have already been uploaded and deleted.')
+                else:
+                    logger.error(f'Max retry attempts reached for: {filename}')
+            else:
+                # Process new uploads
+                filename = video_queue.get(timeout=5)
+                if os.path.exists(filename):
+                    try:
+                        # Check if it's a notification video
+                        if "notification_" in filename:
+                            upload_notification_video(filename, CAMERA_ID)
+                            logger.info(f'Notification upload completed: {filename}')
+                        else:
+                            upload_video_footage(filename, CAMERA_ID)
+                            logger.info(f'Upload completed: {filename}')
+                        os.remove(filename)  # Only delete if upload succeeds
+                    except Exception as upload_error:
+                        logger.error(f"Upload failed for {filename}: {str(upload_error)}")
+                        failed_uploads.append((filename, CAMERA_ID, 1))
+                else:
+                    logger.warning(f'File does not exist: {filename}. It may have already been uploaded and deleted.')
+        except Empty:
+            continue
+        except Exception as e:
+            logger.error(f"Error in upload thread: {str(e)}")
+            if 'filename' in locals() and os.path.exists(filename):
+                failed_uploads.append((filename, CAMERA_ID, 1))
+
+    logger.info('Stopping upload thread')
+
+
+    
+# Process frames
 def process_frame(frame):
     current_time = time.time()
     results = model(frame)
@@ -126,65 +250,12 @@ def process_frame(frame):
 
     return frame_with_boxes, fall_detected
 
-def video_saving_thread():
-    global current_video_writer, current_video_start_time
-    
-    while not stop_thread.is_set():
-        current_time = time.time()
-        
-        if current_video_start_time is None or (current_time - current_video_start_time) >= FOOTAGE_TIME:
-            save_and_upload_video_footage()
-            
-            current_video_start_time = current_time
-            filename = f"{CAMERA_ID}_{datetime.fromtimestamp(current_video_start_time).strftime('%Y-%m-%d_%H-%M-%S')}.mp4"
-            fourcc = cv2.VideoWriter_fourcc(*'avc1')
-            current_video_writer = cv2.VideoWriter(filename, fourcc, MAX_FPS, (FRAME_WIDTH, FRAME_HEIGHT))
-            logger.info(f'Started new video segment: {filename}')
-        
-        time.sleep(1)  # Check every second
-
-    logger.info('Stopping video saving thread')
-    save_and_upload_video_footage()  # Final save when stopping
-    
-def upload_thread_func():
-    uploaded_files = set()
-    while not stop_thread.is_set():
-        try:
-            filename, camera_id = upload_queue.get(timeout=5)
-            if filename not in uploaded_files:
-                logger.info(f'Uploading video: {filename}')
-                upload_video_footage(filename, camera_id)
-                uploaded_files.add(filename)
-                logger.info(f'Upload completed: {filename}')
-            else:
-                logger.info(f'File already uploaded, skipping: {filename}')
-        except Empty:
-            continue
-        except Exception as e:
-            logger.error(f"Error in upload thread: {str(e)}")
-
-    logger.info('Stopping upload thread')
-    
-def process_notification(notification_video_filename, fall_detected_time, fall_frame):
-    global email_sent
-    notification_video_url = upload_notification_video(notification_video_filename, CAMERA_ID)
-    if notification_video_url and not email_sent:
-        send_email(notification_video_url, fall_detected_time, fall_frame, CAMERA_ID)
-        email_sent = True
-    
-def process_fall_confirmation(frame_with_boxes, fall_detected_time):
-    global email_sent
-    
-    notification_video_filename = save_notification_video(buffer_C, fall_detected_time, CAMERA_ID)
-    if notification_video_filename:
-        upload_queue.put((notification_video_filename, CAMERA_ID))
-        Thread(target=process_notification, args=(notification_video_filename, fall_detected_time, frame_with_boxes)).start()
-
-
-
+# Generate Frame
 def gen_frames():
     global image_thread, footage_video_thread, buffer_A, buffer_B, buffer_C, buffer_D, upload_thread
     global current_video_writer, last_fall_confirmation_time, fall_detection_enabled, email_sent
+    
+    start_video_processes()
 
     cam = cv2.VideoCapture(0)
     if not cam.isOpened():
@@ -195,16 +266,6 @@ def gen_frames():
     fall_confirmed = False
     EVENT = 0
     fps_time = 0
-
-    if footage_video_thread is None or not footage_video_thread.is_alive():
-        footage_video_thread = threading.Thread(target=video_saving_thread)
-        footage_video_thread.start()
-        logger.info('Video saving thread started')
-
-    if upload_thread is None or not upload_thread.is_alive():
-        upload_thread = threading.Thread(target=upload_thread_func)
-        upload_thread.start()
-        logger.info('Upload thread started')
 
     while True:
         success, frame = cam.read()
@@ -240,7 +301,7 @@ def gen_frames():
 
                         Thread(target=process_fall_confirmation, args=(frame_with_boxes, fall_detected_time)).start()
 
-                        logger.info(f"Fall detection system reset for: {TIME/60} minutes.")
+                        logger.info(f"Fall detection system reset for: {TIME} second.")
                         fall_detection_enabled = False
                         email_sent = False
                 else:
@@ -249,7 +310,7 @@ def gen_frames():
                 if current_time - last_fall_confirmation_time > TIME:
                     fall_detection_enabled = True
                     EVENT = 0
-                    logger.info(f"Fall detection system starting after reset {TIME/60} minutes...")
+                    logger.info(f"Fall detection system starting..")
 
             if fall_confirmed:
                 buffer_D.append((time.time(), frame.copy(), frame_with_boxes))
@@ -287,7 +348,7 @@ def gen_frames():
                    b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
     cam.release()
-
+    
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -308,8 +369,8 @@ if __name__ == '__main__':
         logger.error(f'Error running the flask app: {str(e)}')
     finally:
         stop_thread.set()
-        logger.info('Stop signal set, waiting for thread to finish')
-        if footage_video_thread:
+        logger.info('Stop signal set, waiting for threads to finish')
+        if footage_video_thread and footage_video_thread.is_alive():
             footage_video_thread.join()
         if upload_thread and upload_thread.is_alive():
             upload_thread.join()
