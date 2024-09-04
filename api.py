@@ -307,7 +307,10 @@ def send_email(video_url, fall_time, fall_frame, camera_id):
     tdatetime = datetime.now()
     tstr = tdatetime.strftime("%Y-%m-%d %H:%M:%S")
     email_sender = 'godapple79@gmail.com'
-    email_password = 'pblh ylrc vlgi aomt'
+    email_password = os.getenv('EMAIL_PWD')
+    
+    if email_password is None:
+        print("Email password not set in environment variables.")
     
     subject = 'Emergency Alert: Fall Detected'
     body = f"""

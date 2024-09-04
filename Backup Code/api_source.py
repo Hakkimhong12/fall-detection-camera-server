@@ -16,7 +16,11 @@ logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=UserWarning, module='google.cloud.firestore_v1.base_collection')
 
 # Firebase initialization
-cred = credentials.Certificate("key/service-account.json")
+key_path = os.getenv('FALL_DETECTION_PROJECT')
+if key_path is None:
+    raise EnvironmentError("FALL_DETECTION_PROJECT environment variable is not set.")
+
+cred = credentials.Certificate(key_path)
 firebase_admin.initialize_app(cred, {
     'storageBucket': 'falldetectionwebsite.appspot.com'
 })
@@ -262,7 +266,7 @@ def send_email(video_url, fall_time, doc_id, fall_frame, last_frame, camera_id= 
     tdatetime = dt.now()
     tstr = tdatetime.strftime("%Y-%m-%d %H:%M:%S")
     email_sender = 'godapple79@gmail.com'
-    email_password = 'pblh ylrc vlgi aomt'
+    email_password = os.getenv('EMAIL_PWD')
     
     subject = 'Emergency Alert: Fall Detected'
     body = f"""
